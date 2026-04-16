@@ -315,6 +315,7 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
 
   Widget _buildChatUI() {
     final theme = Theme.of(context);
+    final showSuggestions = !_messages.any((message) => message.isUser);
 
     return Container(
       decoration: const BoxDecoration(
@@ -386,6 +387,7 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
             controller: _chatController,
             onSend: _handleSend,
             isLoading: _isLoading,
+            showSuggestions: showSuggestions,
             onSuggestionTap: (suggestion) {
               _chatController.value = TextEditingValue(
                 text: suggestion,
