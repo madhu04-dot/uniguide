@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../features/chat/data/api_service.dart';
+import '../features/chat/data/chat_storage_service.dart';
 import '../features/chat/data/message_model.dart';
 import '../features/chat/ui/widgets/chat_input_field.dart';
 import '../features/chat/ui/widgets/chat_message_list.dart';
@@ -17,23 +19,19 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
   int _selectedIndex = 0;
 
   bool _isLoggedIn = false;
+  bool _isLoading = false;
+  bool _isInitializing = true;
+
   String _studentName = 'Guest';
   final String _appVersion = 'v1.1.0';
 
   final ApiService _apiService = ApiService();
+  final ChatStorageService _chatStorageService = ChatStorageService();
   final TextEditingController _chatController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
-  bool _isLoading = false;
-
-  final List<ChatMessage> _messages = [
-    ChatMessage(
-      text:
-          "Hello, I'm UniGuide.\nAsk me anything from your syllabus and I will help you revise faster.",
-      isUser: false,
-      source: 'UniGuide',
-    ),
-  ];
+  List<ChatSession> _chatSessions = [];
+  String? _activeChatId;
 
   static const List<_NavItem> _navItems = [
     _NavItem(
@@ -64,49 +62,192 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
   ];
 
   @override
+  void initState() {
+    super.initState();
+    _loadChats();
+  }
+
+  @override
   void dispose() {
     _chatController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  Future<void> _handleSend() async {
-    final userQuery = _chatController.text.trim();
-    if (userQuery.isEmpty) return;
+  List<ChatMessage> _buildStarterMessages() {
+    return [
+      ChatMessage(
+        text:
+            "Hello, I'm UniGuide.\nAsk me anything from your syllabus and I will help you revise faster.",
+        isUser: false,
+        source: 'UniGuide',
+      ),
+    ];
+  }
+
+  ChatSession _createFreshSession() {
+    return ChatSession.create(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      messages: _buildStarterMessages(),
+    );
+  }
+
+  ChatSession get _activeSession {
+    if (_chatSessions.isEmpty) {
+      final fallbackSession = _createFreshSession();
+      _chatSessions = [fallbackSession];
+      _activeChatId = fallbackSession.id;
+      return fallbackSession;
+    }
+
+    return _chatSessions.firstWhere(
+      (session) => session.id == _activeChatId,
+      orElse: () {
+        final fallbackSession = _chatSessions.first;
+        _activeChatId = fallbackSession.id;
+        return fallbackSession;
+      },
+    );
+  }
+
+  List<ChatMessage> get _messages => _activeSession.messages;
+
+  ChatSession? _sessionForId(String id) {
+    for (final session in _chatSessions) {
+      if (session.id == id) {
+        return session;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _loadChats() async {
+    final sessions = await _chatStorageService.loadSessions();
+    final activeChatId = await _chatStorageService.loadActiveChatId();
+
+    if (!mounted) return;
 
     setState(() {
-      _messages.add(ChatMessage(text: userQuery, isUser: true));
+      if (sessions.isEmpty) {
+        final initialSession = _createFreshSession();
+        _chatSessions = [initialSession];
+        _activeChatId = initialSession.id;
+      } else {
+        _chatSessions = List<ChatSession>.from(sessions)
+          ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+        _activeChatId = _chatSessions.any((session) => session.id == activeChatId)
+            ? activeChatId
+            : _chatSessions.first.id;
+      }
+      _isInitializing = false;
+    });
+
+    await _persistChats();
+  }
+
+  Future<void> _persistChats() {
+    return _chatStorageService.saveSessions(
+      sessions: _chatSessions,
+      activeChatId: _activeChatId,
+    );
+  }
+
+  void _replaceSession(ChatSession updatedSession) {
+    _chatSessions = _chatSessions
+        .map((session) => session.id == updatedSession.id ? updatedSession : session)
+        .toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  }
+
+  String _deriveTitle(List<ChatMessage> messages) {
+    ChatMessage? firstUserMessage;
+    for (final message in messages) {
+      if (message.isUser) {
+        firstUserMessage = message;
+        break;
+      }
+    }
+
+    final title = firstUserMessage?.text.trim() ?? '';
+    if (title.isEmpty) {
+      return 'New chat';
+    }
+    if (title.length <= 42) {
+      return title;
+    }
+    return '${title.substring(0, 42).trimRight()}...';
+  }
+
+  Future<void> _saveMessagesForSession(
+    String sessionId,
+    List<ChatMessage> messages,
+  ) async {
+    final session = _sessionForId(sessionId);
+    if (session == null) return;
+
+    final updatedSession = session.copyWith(
+      messages: messages,
+      title: _deriveTitle(messages),
+      updatedAt: DateTime.now(),
+    );
+
+    setState(() {
+      _replaceSession(updatedSession);
+    });
+
+    await _persistChats();
+  }
+
+  Future<void> _handleSend() async {
+    if (_isInitializing || _isLoading) return;
+
+    final userQuery = _chatController.text.trim();
+    if (userQuery.isEmpty) return;
+    final sessionId = _activeSession.id;
+
+    final pendingMessages = [
+      ..._messages,
+      ChatMessage(text: userQuery, isUser: true),
+    ];
+
+    setState(() {
+      _replaceSession(
+        _activeSession.copyWith(
+          messages: pendingMessages,
+          title: _deriveTitle(pendingMessages),
+          updatedAt: DateTime.now(),
+        ),
+      );
       _chatController.clear();
       _isLoading = true;
     });
 
+    await _persistChats();
     _scrollToBottom();
 
     try {
       final response = await _apiService.getRAGResponse(userQuery);
-
-      setState(() {
-        _messages.add(
-          ChatMessage(
-            text: response,
-            isUser: false,
-            source: 'UniGuide',
-          ),
-        );
-      });
+      await _saveMessagesForSession(sessionId, [
+        ...pendingMessages,
+        ChatMessage(
+          text: response,
+          isUser: false,
+          source: 'UniGuide',
+        ),
+      ]);
     } catch (_) {
-      setState(() {
-        _messages.add(
-          ChatMessage(
-            text:
-                "I couldn't reach the backend. Please make sure the Flask server is running on port 5000.",
-            isUser: false,
-            source: 'System',
-          ),
-        );
-      });
+      await _saveMessagesForSession(sessionId, [
+        ...pendingMessages,
+        ChatMessage(
+          text:
+              "I couldn't reach the backend. Please make sure the Flask server is running on port 5000.",
+          isUser: false,
+          source: 'System',
+        ),
+      ]);
     }
 
+    if (!mounted) return;
     setState(() => _isLoading = false);
     _scrollToBottom();
   }
@@ -124,18 +265,109 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
   }
 
   void _newChat() {
+    final newSession = _createFreshSession();
     setState(() {
-      _messages
-        ..clear()
-        ..add(
-          ChatMessage(
-            text:
-                'New chat ready.\nShare a topic, paste a question, or ask for a concise summary.',
-            isUser: false,
-            source: 'UniGuide',
-          ),
-        );
+      _chatSessions = [newSession, ..._chatSessions];
+      _activeChatId = newSession.id;
+      _selectedIndex = 0;
+      _chatController.clear();
     });
+    _persistChats();
+  }
+
+  Future<void> _openChat(String chatId) async {
+    setState(() {
+      _activeChatId = chatId;
+      _selectedIndex = 0;
+    });
+    await _persistChats();
+    _scrollToBottom();
+  }
+
+  Future<void> _deleteChat(String chatId) async {
+    if (_chatSessions.length == 1) {
+      final replacement = _createFreshSession();
+      setState(() {
+        _chatSessions = [replacement];
+        _activeChatId = replacement.id;
+        _selectedIndex = 0;
+      });
+      await _persistChats();
+      return;
+    }
+
+    setState(() {
+      _chatSessions = _chatSessions.where((session) => session.id != chatId).toList();
+      if (_activeChatId == chatId) {
+        _activeChatId = _chatSessions.first.id;
+      }
+    });
+    await _persistChats();
+  }
+
+  Future<void> _showRenameDialog(ChatSession session) async {
+    final controller = TextEditingController(text: session.title);
+    final updatedTitle = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Rename chat'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            inputFormatters: [
+              LengthLimitingTextInputFormatter(42),
+            ],
+            decoration: const InputDecoration(
+              hintText: 'Enter chat title',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+
+    controller.dispose();
+
+    if (updatedTitle == null || updatedTitle.isEmpty) return;
+
+    setState(() {
+      _replaceSession(
+        session.copyWith(
+          title: updatedTitle,
+          updatedAt: DateTime.now(),
+        ),
+      );
+    });
+    await _persistChats();
+  }
+
+  String _formatSessionTime(DateTime time) {
+    final now = DateTime.now();
+    final difference = now.difference(time);
+
+    if (difference.inMinutes < 1) {
+      return 'Updated just now';
+    }
+    if (difference.inHours < 1) {
+      return 'Updated ${difference.inMinutes} min ago';
+    }
+    if (difference.inDays < 1) {
+      return 'Updated ${difference.inHours} hr ago';
+    }
+    if (difference.inDays == 1) {
+      return 'Updated yesterday';
+    }
+    return 'Updated ${time.day}/${time.month}/${time.year}';
   }
 
   void _toggleLogin() {
@@ -195,7 +427,11 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
       body: Row(
         children: [
           if (isLargeScreen) _buildSidebar(theme),
-          Expanded(child: _buildMainContent()),
+          Expanded(
+            child: _isInitializing
+                ? const Center(child: CircularProgressIndicator())
+                : _buildMainContent(),
+          ),
         ],
       ),
     );
@@ -307,7 +543,7 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
       case 3:
         return const BranchScreen(category: 'notes');
       case 4:
-        return const Center(child: Text('History will appear here.'));
+        return _buildHistoryView();
       default:
         return _buildChatUI();
     }
@@ -355,7 +591,7 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Ask better questions, get cleaner answers',
+                            _activeSession.title,
                             style: theme.textTheme.titleLarge?.copyWith(
                               fontWeight: FontWeight.w700,
                               color: const Color(0xFF162132),
@@ -363,7 +599,7 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Paste text, ask for summaries, and copy responses instantly.',
+                            'Continue this chat, start a new one, or reopen an older conversation from History.',
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: const Color(0xFF5D6B7D),
                             ),
@@ -397,6 +633,92 @@ class _AdaptiveScaffoldState extends State<AdaptiveScaffold> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildHistoryView() {
+    final theme = Theme.of(context);
+
+    if (_chatSessions.isEmpty) {
+      return const Center(
+        child: Text('Your previous chats will appear here.'),
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(20),
+      itemCount: _chatSessions.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 12),
+      itemBuilder: (context, index) {
+        final session = _chatSessions[index];
+        final isActive = session.id == _activeChatId;
+
+        return Card(
+          child: ListTile(
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 18,
+              vertical: 10,
+            ),
+            title: Text(
+              session.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+                color: const Color(0xFF162132),
+              ),
+            ),
+            subtitle: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    session.previewText,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF5D6B7D),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _formatSessionTime(session.updatedAt),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF6B7280),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            leading: CircleAvatar(
+              backgroundColor:
+                  isActive ? const Color(0xFF1B4D8C) : const Color(0xFFE7F0FB),
+              child: Icon(
+                Icons.chat_bubble_outline_rounded,
+                color: isActive ? Colors.white : const Color(0xFF1B4D8C),
+              ),
+            ),
+            trailing: PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'open') {
+                  _openChat(session.id);
+                } else if (value == 'rename') {
+                  _showRenameDialog(session);
+                } else if (value == 'delete') {
+                  _deleteChat(session.id);
+                }
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'open', child: Text('Open')),
+                PopupMenuItem(value: 'rename', child: Text('Rename')),
+                PopupMenuItem(value: 'delete', child: Text('Delete')),
+              ],
+            ),
+            onTap: () => _openChat(session.id),
+          ),
+        );
+      },
     );
   }
 

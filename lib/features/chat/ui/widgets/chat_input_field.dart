@@ -17,6 +17,20 @@ class ChatInputField extends StatelessWidget {
   final bool showSuggestions;
   final ValueChanged<String>? onSuggestionTap;
 
+  KeyEventResult _handleKeyPress(KeyEvent event) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.enter &&
+        !HardwareKeyboard.instance.isShiftPressed) {
+      onSend();
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
+
   static const List<String> _suggestions = [
     'Summarize this topic for me',
     'Give me important exam questions',
@@ -102,15 +116,21 @@ class ChatInputField extends StatelessWidget {
                       icon: const Icon(Icons.content_paste_rounded),
                     ),
                     Expanded(
-                      child: TextField(
-                        controller: controller,
-                        minLines: 1,
-                        maxLines: 6,
-                        textCapitalization: TextCapitalization.sentences,
-                        decoration: const InputDecoration(
-                          hintText: 'Ask UniGuide anything from your syllabus',
-                          border: InputBorder.none,
-                          contentPadding: EdgeInsets.symmetric(vertical: 16),
+                      child: Focus(
+                        onKeyEvent: (_, event) => _handleKeyPress(event),
+                        child: TextField(
+                          controller: controller,
+                          minLines: 1,
+                          maxLines: 6,
+                          keyboardType: TextInputType.multiline,
+                          textInputAction: TextInputAction.newline,
+                          textCapitalization: TextCapitalization.sentences,
+                          decoration: const InputDecoration(
+                            hintText:
+                                'Ask UniGuide anything from your syllabus',
+                            border: InputBorder.none,
+                            contentPadding: EdgeInsets.symmetric(vertical: 16),
+                          ),
                         ),
                       ),
                     ),
